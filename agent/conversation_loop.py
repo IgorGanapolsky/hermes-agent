@@ -614,6 +614,15 @@ def run_conversation(
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
+    # Wall-clock watchdog: cap how long a single turn may run so a slow or looping model on a
+    # large context cannot grind for hours (the 12h glm-5.2 runaway had NO time bound at all).
+    # Env HERMES_MAX_TURN_SECONDS overrides; set 0 to disable. Checked at the top of each iteration.
+    try:
+        _turn_max_seconds = float(os.getenv("HERMES_MAX_TURN_SECONDS", "1200"))
+    except (TypeError, ValueError):
+        _turn_max_seconds = 1200.0
+    _turn_deadline = (time.monotonic() + _turn_max_seconds) if _turn_max_seconds > 0 else None
+
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -645,6 +654,17 @@ def run_conversation(
             _turn_exit_reason = "interrupted_by_user"
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
+            break
+
+        # Wall-clock watchdog (see _turn_deadline above): abort an over-long turn HONESTLY
+        # instead of looping. Durable fix for "stuck for hours, never gives output".
+        if _turn_deadline is not None and time.monotonic() > _turn_deadline:
+            _turn_exit_reason = f"wall_clock_exceeded({int(_turn_max_seconds)}s)"
+            if not agent.quiet_mode:
+                agent._safe_print(
+                    f"\n⏱️  Turn exceeded {int(_turn_max_seconds)}s wall-clock budget — "
+                    "aborting to prevent a runaway."
+                )
             break
         
         api_call_count += 1

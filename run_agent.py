@@ -2170,10 +2170,18 @@ class AIAgent:
         # widens exposure vs the old empty-body "HTTP 400" string).
         response = getattr(error, "response", None)
         if response is not None:
+            # A streaming response raises httpx.ResponseNotRead on .text until
+            # read() is called (and StreamClosed once the stream is gone) —
+            # the summarizer must never raise, or the conversation loop dies
+            # on the summary instead of falling back.
             try:
                 snippet = (getattr(response, "text", None) or "").strip()
             except Exception:
-                snippet = ""
+                try:
+                    response.read()
+                    snippet = (getattr(response, "text", None) or "").strip()
+                except Exception:
+                    snippet = ""
             if snippet:
                 status_code = getattr(error, "status_code", None)
                 prefix = f"HTTP {status_code}: " if status_code else ""

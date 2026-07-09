@@ -135,7 +135,7 @@ _hermes_completion() {{
     fi
 }}
 
-complete -F _hermes_completion hermes
+complete -F _hermes_completion hermes hermes-yolo
 """
 
 
@@ -199,7 +199,7 @@ def generate_zsh(parser: argparse.ArgumentParser) -> str:
             )
     sub_cases_str = "\n".join(sub_cases)
 
-    return f"""#compdef hermes
+    return f"""#compdef hermes hermes-yolo
 # Hermes Agent zsh completion
 # Add to ~/.zshrc:
 #   eval "$(hermes completion zsh)"
@@ -240,7 +240,7 @@ _hermes() {{
     esac
 }}
 
-compdef _hermes hermes
+compdef _hermes hermes hermes-yolo
 """
 
 
@@ -315,5 +315,8 @@ def generate_fish(parser: argparse.ArgumentParser) -> str:
                     f"-a '(__hermes_profiles)' -d 'Profile name'"
                 )
 
+    lines.append("")
+    lines.append("# inherit completions from hermes to hermes-yolo")
+    lines.append("complete -c hermes-yolo -w hermes")
     lines.append("")
     return "\n".join(lines)

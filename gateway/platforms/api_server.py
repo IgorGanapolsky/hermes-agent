@@ -1367,10 +1367,429 @@ class APIServerAdapter(BasePlatformAdapter):
     # HTTP Handlers
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Leash gate rules (mobile Leash Pro — hermes-mobile T-80, cursor)
+    # ------------------------------------------------------------------
+    # Standing permission gates the phone can inspect/remove. The gateway's
+    # real model is two config lists: `command_allowlist` (Bash commands that
+    # are permanently auto-approved = "allow" rules) and
+    # `security.website_blocklist.domains` (URLs always blocked = "block"
+    # rules). We expose them as one flat rule list in the schema that
+    # hermes-mobile/src/utils/gateRulesParsing.ts already parses.
+
+    @staticmethod
+    def _encode_gate_id(decision: str, pattern: str) -> str:
+        import base64
+
+        return (
+            base64.urlsafe_b64encode(f"{decision}\n{pattern}".encode("utf-8"))
+            .decode("ascii")
+            .rstrip("=")
+        )
+
+    @staticmethod
+    def _decode_gate_id(rule_id: str):
+        import base64
+
+        pad = "=" * (-len(rule_id) % 4)
+        try:
+            raw = base64.urlsafe_b64decode(rule_id + pad).decode("utf-8")
+        except Exception:
+            return None, None
+        decision, _, pattern = raw.partition("\n")
+        return decision, pattern
+
+    def _collect_gate_rules(self):
+        from hermes_cli.config import cfg_get, load_config
+
+        cfg = load_config() or {}
+        rules = []
+        for pat in cfg.get("command_allowlist") or []:
+            if isinstance(pat, str) and pat.strip():
+                rules.append(
+                    {
+                        "id": self._encode_gate_id("allow", pat),
+                        "pattern": pat,
+                        "tool_name": "Bash",
+                        "decision": "allow",
+                        "scope": "always",
+                        "source": "command_allowlist",
+                    }
+                )
+        domains = cfg_get(cfg, "security", "website_blocklist", "domains", default=[]) or []
+        for dom in domains:
+            if isinstance(dom, str) and dom.strip():
+                rules.append(
+                    {
+                        "id": self._encode_gate_id("block", dom),
+                        "pattern": dom,
+                        "tool_name": "WebFetch",
+                        "decision": "block",
+                        "scope": "always",
+                        "source": "website_blocklist",
+                    }
+                )
+        return cfg, rules
+
+    async def _handle_list_gates(self, request: "web.Request") -> "web.Response":
+        """GET /v1/gates — standing allow/block permission rules for Leash."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        try:
+            _cfg, rules = self._collect_gate_rules()
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response({"error": {"message": str(exc)}}, status=500)
+        return web.json_response({"object": "hermes.gates", "gates": rules})
+
+    async def _handle_patch_gate(self, request: "web.Request") -> "web.Response":
+        """PATCH /v1/gates/{gate_id} — decision toggle (intentionally 409).
+
+        The real config has an allow-command list and a block-domain list but
+        NO command denylist, so flipping an allow-command to 'block' has no
+        coherent destination. Return an honest 409 (not a silent success) so
+        the Leash UI shows a real message. Designing a denylist model is the
+        feature owner's call (hermes-mobile Leash Pro + gateway), not a
+        unilateral write from this endpoint.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        return web.json_response(
+            {
+                "error": {
+                    "type": "not_supported",
+                    "message": (
+                        "Decision toggle isn't supported yet: the gateway models "
+                        "allow-commands and block-domains as separate lists with no "
+                        "command denylist. Delete the rule, or add the inverse rule "
+                        "from your computer."
+                    ),
+                }
+            },
+            status=409,
+        )
+
+    async def _handle_delete_gate(self, request: "web.Request") -> "web.Response":
+        """DELETE /v1/gates/{gate_id} — remove a standing rule from config."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        rule_id = request.match_info.get("gate_id", "")
+        decision, pattern = self._decode_gate_id(rule_id)
+        if not decision or not pattern:
+            return web.json_response({"error": {"message": "Unknown gate id."}}, status=404)
+
+        from hermes_cli.config import load_config, save_config
+
+        cfg = load_config() or {}
+        removed = False
+        if decision == "allow":
+            lst = cfg.get("command_allowlist")
+            if isinstance(lst, list) and pattern in lst:
+                cfg["command_allowlist"] = [x for x in lst if x != pattern]
+                removed = True
+        elif decision == "block":
+            sec = cfg.get("security")
+            wbl = sec.get("website_blocklist") if isinstance(sec, dict) else None
+            doms = wbl.get("domains") if isinstance(wbl, dict) else None
+            if isinstance(doms, list) and pattern in doms:
+                wbl["domains"] = [x for x in doms if x != pattern]
+                removed = True
+        if not removed:
+            return web.json_response({"error": {"message": "Rule not found."}}, status=404)
+        try:
+            save_config(cfg)
+        except Exception as exc:  # noqa: BLE001
+            return web.json_response({"error": {"message": str(exc)}}, status=500)
+        return web.json_response(
+            {"deleted": rule_id, "decision": decision, "pattern": pattern}
+        )
+
+    async def _handle_obsidian_projects(self, request: "web.Request") -> "web.Response":
+        """GET /v1/obsidian/projects — list projects defined in the central Obsidian vault."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        vault_path = os.path.expanduser("~/Documents/AI-Agent-Sync")
+        projects_file = os.path.join(vault_path, "PROJECTS.md")
+        if not os.path.exists(projects_file):
+            projects_file = os.path.join(vault_path, "Projects", "README.md")
+
+        if not os.path.exists(projects_file):
+            return web.json_response({
+                "object": "list",
+                "data": [],
+                "error": "Obsidian projects index not found."
+            })
+
+        projects = []
+        try:
+            with open(projects_file, "r", encoding="utf-8") as f:
+                content = f.read()
+
+            lines = content.splitlines()
+            in_table = False
+            for line in lines:
+                line = line.strip()
+                if line.startswith("|") and line.endswith("|"):
+                    parts = [p.strip() for p in line.split("|")[1:-1]]
+                    if not parts or all(p == "" or p.startswith("-") for p in parts):
+                        continue
+                    # Detect header
+                    if any(p.lower() == "project" for p in parts):
+                        in_table = True
+                        continue
+                    if in_table:
+                        # Find the local path: usually starts with / or ~
+                        local_path = None
+                        vault_home = ""
+                        rule = ""
+                        for part in parts[1:]:
+                            cleaned = part.strip("` ")
+                            if cleaned.startswith("/") or cleaned.startswith("~"):
+                                local_path = cleaned
+                            elif "Projects/" in part or part.endswith("/"):
+                                vault_home = cleaned
+                            elif part and not rule:
+                                rule = part
+
+                        if local_path:
+                            projects.append({
+                                "name": parts[0].strip("` "),
+                                "workspacePath": local_path,
+                                "vaultHome": vault_home,
+                                "rule": rule
+                            })
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        return web.json_response({
+            "object": "list",
+            "data": projects
+        })
+
+    async def _handle_obsidian_agents(self, request: "web.Request") -> "web.Response":
+        """GET /v1/obsidian/agents — list active agents from the central Obsidian vault."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        vault_path = os.path.expanduser("~/Documents/AI-Agent-Sync")
+        agents_dir = os.path.join(vault_path, "Agent-State")
+        if not os.path.exists(agents_dir):
+            return web.json_response({
+                "object": "list",
+                "data": [],
+                "error": "Agent-State folder not found."
+            })
+
+        import time as _time
+        import subprocess
+
+        running_commands = []
+        try:
+            out = subprocess.check_output(["ps", "-axo", "command"], text=True, errors="replace")
+            running_commands = [line.strip().lower() for line in out.splitlines()]
+        except Exception:
+            pass
+
+        def is_process_running(agent_name):
+            normalized = agent_name.lower()
+            for cmd in running_commands:
+                if normalized == "claude-code" and ("claude-code" in cmd or "claude code" in cmd or "bin/claude" in cmd):
+                    return True
+                if normalized == "hermes" and ("/hermes " in cmd or "hermes-yolo" in cmd or "hermes_cli" in cmd):
+                    return True
+                if normalized == "antigravity" and ("antigravity" in cmd):
+                    return True
+                if normalized == "cursor" and ("cursor" in cmd):
+                    return True
+                if normalized == "gemini" and ("gemini" in cmd):
+                    return True
+            return False
+
+        # Real agents only — not vault state/income notes. Most agent files do
+        # not set a frontmatter type, so use a name allowlist plus any
+        # `type: agent*` frontmatter.
+        KNOWN_AGENTS = {"claude-code", "claude", "codex", "cursor",
+                        "antigravity", "gemini", "hermes"}
+        now = _time.time()
+        agents = []
+        try:
+            for entry in os.scandir(agents_dir):
+                if not (entry.is_file() and entry.name.endswith(".md")):
+                    continue
+                name = entry.name[:-3]
+                # Parse ONLY YAML frontmatter (between the first two `---`) for an
+                # optional type. NEVER scrape prose lines — the old parser matched
+                # any `**Status**:` sentence and leaked garbage like
+                # "100% verified and all 993 Jest tests are passing" as a status.
+                fm_type = ""
+                try:
+                    with open(entry.path, "r", encoding="utf-8", errors="replace") as f:
+                        if f.readline().strip() == "---":
+                            for _ in range(20):
+                                line = f.readline()
+                                if not line or line.strip() == "---":
+                                    break
+                                if ":" in line:
+                                    k, v = line.split(":", 1)
+                                    if k.strip().lower() == "type":
+                                        fm_type = v.strip().lower()
+                except Exception:
+                    pass
+                if name.lower() not in KNOWN_AGENTS and "agent" not in fm_type:
+                    continue
+                try:
+                    mtime = entry.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                age = max(0.0, now - mtime)
+                # Status from real recent activity — deterministic, never "unknown".
+                if is_process_running(name):
+                    status = "active"
+                elif age < 900:
+                    status = "active"
+                elif age < 21600:
+                    status = "idle"
+                else:
+                    status = "away"
+                agents.append({
+                    "name": name,
+                    "status": status,
+                    "role": "agent",
+                    "lastActive": mtime,
+                    "age_seconds": int(age),
+                })
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
+        agents.sort(key=lambda a: a.get("age_seconds", 1 << 30))
+        return web.json_response({
+            "object": "list",
+            "data": agents
+        })
+
+    async def _handle_projects(self, request: "web.Request") -> "web.Response":
+        """GET /api/projects — vault-backed project + agent-activity directory.
+
+        Feeds the mobile app: which workspace projects exist on this machine,
+        and which AI agents are actively working per the AI-Agent-Sync vault,
+        so prompts can be targeted at a specific project.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        import time as _time
+        from pathlib import Path as _Path
+
+        home = _Path.home()
+        now = _time.time()
+
+        agents = []
+        vault_used = ""
+        for vault in (home / "Documents" / "AI-Agent-Sync", home / ".hermes" / "ai-vault"):
+            state_dir = vault / "Agent-State"
+            try:
+                entries = sorted(state_dir.glob("*.md"))
+            except OSError:
+                continue
+            if not entries:
+                continue
+            vault_used = str(vault)
+            for path in entries:
+                try:
+                    stat = path.stat()
+                    summary = ""
+                    with path.open("r", encoding="utf-8", errors="replace") as fh:
+                        for line in fh:
+                            line = line.strip()
+                            if line:
+                                summary = line.lstrip("# ").strip()[:160]
+                                break
+                    agents.append(
+                        {
+                            "name": path.stem,
+                            "updated_at": stat.st_mtime,
+                            "age_seconds": max(0, int(now - stat.st_mtime)),
+                            "summary": summary,
+                        }
+                    )
+                except OSError:
+                    continue
+            break
+        agents.sort(key=lambda item: item["age_seconds"])
+
+        projects = []
+        workspace_root = home / "workspace" / "git" / "igor"
+        try:
+            candidates = sorted(workspace_root.iterdir())
+        except OSError:
+            candidates = []
+        for entry in candidates:
+            if len(projects) >= 40:
+                break
+            if not entry.is_dir() or entry.name.startswith("."):
+                continue
+            plan = entry / "plan.md"
+            has_plan = plan.is_file()
+            if not (has_plan or (entry / "AGENTS.md").is_file() or (entry / ".git").exists()):
+                continue
+            project = {
+                "id": entry.name,
+                "name": entry.name,
+                "workspace_path": str(entry),
+                "has_plan": has_plan,
+            }
+            if has_plan:
+                try:
+                    project["plan_updated_at"] = plan.stat().st_mtime
+                except OSError:
+                    pass
+            projects.append(project)
+
+        return web.json_response(
+            {
+                "object": "hermes.projects",
+                "generated_at": now,
+                "vault": vault_used,
+                "vault_available": bool(vault_used),
+                "agents": agents,
+                "projects": projects,
+            }
+        )
+
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
+        import socket as _socket
+
+        hostname = ""
+        try:
+            hostname = _socket.gethostname()
+        except Exception:
+            pass
+
+        local_ip = ""
+        try:
+            # Simple UDP socket trick to find the local interface IP
+            s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+        except Exception:
+            pass
+
         return web.json_response(
-            {"status": "ok", "platform": "hermes-agent", "version": _hermes_version()}
+            {
+                "status": "ok",
+                "platform": "hermes-agent",
+                "version": _hermes_version(),
+                "hostname": hostname,
+                "local_ip": local_ip,
+            }
         )
 
     async def _handle_health_detailed(self, request: "web.Request") -> "web.Response":
@@ -1660,7 +2079,21 @@ class APIServerAdapter(BasePlatformAdapter):
             "tool_name", "timestamp", "token_count", "finish_reason", "reasoning",
             "reasoning_content",
         )
-        return {key: message.get(key) for key in safe_keys if key in message}
+        resp = {key: message.get(key) for key in safe_keys if key in message}
+        # Display-only: collapse the big context-compaction handoff block into a
+        # one-line marker so clients render a chip, not a wall. The agent still sees
+        # the full summary during a run; this only affects the read-back transcript.
+        content = resp.get("content")
+        if isinstance(content, str):
+            head = content.lstrip("\"'` \n\t").upper()
+            if (
+                head.startswith("[CONTEXT COMPACTION")
+                or head.startswith("[CONTEXT SUMMARY]")
+                or head.startswith("[PRIOR CONTEXT")
+            ):
+                resp["content"] = "\u2026 Earlier conversation summarized to save context."
+                resp["compacted_summary"] = True
+        return resp
 
     async def _read_json_body(self, request: "web.Request") -> tuple[Dict[str, Any], Optional["web.Response"]]:
         try:
@@ -4774,6 +5207,12 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
+            self._app.router.add_get("/api/projects", self._handle_projects)
+            self._app.router.add_get("/v1/obsidian/projects", self._handle_obsidian_projects)
+            self._app.router.add_get("/v1/obsidian/agents", self._handle_obsidian_agents)
+            self._app.router.add_get("/v1/gates", self._handle_list_gates)
+            self._app.router.add_patch("/v1/gates/{gate_id}", self._handle_patch_gate)
+            self._app.router.add_delete("/v1/gates/{gate_id}", self._handle_delete_gate)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
             self._app.router.add_get("/api/sessions/{session_id}", self._handle_get_session)

@@ -236,7 +236,22 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         )
         if not head_rev or not target_rev:
             return None
-        return 0 if head_rev == target_rev else UPDATE_AVAILABLE_NO_COUNT
+        if head_rev == target_rev:
+            return 0
+        # HEAD != target, but HEAD may be *ahead* (local commits on top of
+        # upstream) rather than behind.  merge-base --is-ancestor works on
+        # shallow repos and distinguishes the two: if target is an ancestor
+        # of HEAD, we're ahead (not behind), so return 0.
+        anc = _git_stdout(
+            ["merge-base", "--is-ancestor", target_rev, head_rev],
+            cwd=repo_dir,
+        )
+        # merge-base --is-ancestor returns exit 0 (stdout present) when true;
+        # _git_stdout returns None on non-zero exit, so a non-None result
+        # means "yes, target is an ancestor of HEAD" => we're ahead, not behind.
+        if anc is not None:
+            return 0
+        return UPDATE_AVAILABLE_NO_COUNT
 
     try:
         result = subprocess.run(
