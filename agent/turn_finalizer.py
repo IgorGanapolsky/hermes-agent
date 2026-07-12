@@ -50,24 +50,43 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
-    if final_response is None and (
+    wall_clock_exceeded = str(_turn_exit_reason).startswith("wall_clock_exceeded(")
+    budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
-    ):
-        # Budget exhausted — ask the model for a summary via one extra
-        # API call with tools stripped.  _handle_max_iterations injects a
-        # user message and makes a single toolless request.
-        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
-        agent._emit_status(
-            f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-            "— asking model to summarise"
-        )
-        if not agent.quiet_mode:
-            agent._safe_print(
-                f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
-                "— requesting summary..."
+    )
+    needs_forced_final_response = (
+        final_response is None
+        and not interrupted
+        and not failed
+        and (budget_exhausted or wall_clock_exceeded)
+    )
+
+    if needs_forced_final_response:
+        # A hard loop boundary must still produce one user-visible answer.
+        # Reuse the tools-disabled summary path so the model cannot restart
+        # work after either the iteration or wall-clock safety limit fires.
+        if budget_exhausted:
+            _turn_exit_reason = (
+                f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
             )
-        final_response = agent._handle_max_iterations(messages, api_call_count)
+            status = (
+                f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                "— asking model to summarise"
+            )
+        else:
+            status = "⏱️ Turn time limit reached — preparing the final report"
+        agent._emit_status(status)
+        if not agent.quiet_mode:
+            agent._safe_print(f"\n{status}")
+        if wall_clock_exceeded and not budget_exhausted:
+            final_response = agent._handle_max_iterations(
+                messages,
+                api_call_count,
+                reason="wall_clock",
+            )
+        else:
+            final_response = agent._handle_max_iterations(messages, api_call_count)
 
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
@@ -126,6 +145,7 @@ def finalize_turn(
     completed = (
         final_response is not None
         and not failed
+        and not wall_clock_exceeded
         and (
             api_call_count < agent.max_iterations
             or normal_text_response

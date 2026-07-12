@@ -57,6 +57,7 @@ class _StubAgent:
             setattr(self, attr, 0)
         self.session_cost_status = "ok"
         self.session_cost_source = "stub"
+        self.forced_final_response_reason = None
 
     # --- fallible cleanup surfaces -------------------------------------
     def _save_trajectory(self, *a, **k):
@@ -81,7 +82,8 @@ class _StubAgent:
     def _safe_print(self, *a, **k):
         pass
 
-    def _handle_max_iterations(self, messages, n):
+    def _handle_max_iterations(self, messages, n, *, reason="iteration_limit"):
+        self.forced_final_response_reason = reason
         return "PARTIAL SUMMARY FROM MODEL"
 
     def _file_mutation_verifier_enabled(self):
@@ -182,3 +184,29 @@ def test_text_response_on_last_allowed_call_is_completed():
     )
     assert result["final_response"] == "final report"
     assert result["completed"] is True
+
+
+def test_wall_clock_exit_returns_and_persists_one_final_report():
+    agent = _StubAgent(raise_in=())
+    agent.max_iterations = 90
+    agent.iteration_budget = type(
+        "Budget",
+        (),
+        {"used": 11, "max_total": 90, "remaining": 79},
+    )()
+
+    result = _run(
+        agent,
+        final_response=None,
+        api_call_count=18,
+        turn_exit_reason="wall_clock_exceeded(1200s)",
+    )
+
+    assert result["final_response"] == "PARTIAL SUMMARY FROM MODEL"
+    assert result["turn_exit_reason"] == "wall_clock_exceeded(1200s)"
+    assert result["completed"] is False
+    assert agent.forced_final_response_reason == "wall_clock"
+    assert result["messages"][-1] == {
+        "role": "assistant",
+        "content": "PARTIAL SUMMARY FROM MODEL",
+    }

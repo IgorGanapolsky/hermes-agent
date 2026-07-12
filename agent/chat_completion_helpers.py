@@ -1573,15 +1573,32 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
 
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
-    """Request a summary when max iterations are reached. Returns the final response text."""
-    print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
-
-    summary_request = (
-        "You've reached the maximum number of tool-calling iterations allowed. "
-        "Please provide a final response summarizing what you've found and accomplished so far, "
-        "without calling any more tools."
-    )
+def handle_max_iterations(
+    agent,
+    messages: list,
+    api_call_count: int,
+    *,
+    reason: str = "iteration_limit",
+) -> str:
+    """Request one tools-disabled final response after a hard loop boundary."""
+    if reason == "wall_clock":
+        print("⏱️  Reached the turn time limit. Requesting final report...")
+        failure_response = "I reached the turn time limit and couldn't generate a final report."
+        client_reason = "wall_clock_final_report"
+        summary_request = (
+            "The current turn reached its wall-clock safety limit. Do not call any more tools. "
+            "Provide a concise final response that leads with verified results, states what was "
+            "actually completed, and clearly identifies any unfinished work."
+        )
+    else:
+        print(f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary...")
+        failure_response = "I reached the iteration limit and couldn't generate a summary."
+        client_reason = "iteration_limit_summary"
+        summary_request = (
+            "You've reached the maximum number of tool-calling iterations allowed. "
+            "Please provide a final response summarizing what you've found and accomplished so far, "
+            "without calling any more tools."
+        )
     messages.append({"role": "user", "content": summary_request})
 
     try:
@@ -1741,7 +1758,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=agent._is_anthropic_oauth)
                 final_response = (_summary_result.content or "").strip()
             else:
-                summary_response = agent._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
+                summary_response = agent._ensure_primary_openai_client(reason=client_reason).chat.completions.create(**summary_kwargs)
                 _summary_result = agent._get_transport().normalize_response(summary_response)
                 final_response = (_summary_result.content or "").strip()
 
@@ -1751,7 +1768,7 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
             if final_response:
                 messages.append({"role": "assistant", "content": final_response})
             else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
+                final_response = failure_response
         else:
             # Retry summary generation
             if agent.api_mode == "codex_responses":
@@ -1794,13 +1811,13 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                 if final_response:
                     messages.append({"role": "assistant", "content": final_response})
                 else:
-                    final_response = "I reached the iteration limit and couldn't generate a summary."
+                    final_response = failure_response
             else:
-                final_response = "I reached the iteration limit and couldn't generate a summary."
+                final_response = failure_response
 
     except Exception as e:
         logger.warning(f"Failed to get summary response: {e}")
-        final_response = f"I reached the maximum iterations ({agent.max_iterations}) but couldn't summarize. Error: {str(e)}"
+        final_response = f"{failure_response[:-1]} Error: {str(e)}"
 
     return final_response
 

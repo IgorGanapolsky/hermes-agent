@@ -3655,6 +3655,41 @@ class TestHandleMaxIterations:
         assert len(result) > 0
         assert "summary" in result.lower()
 
+    def test_wall_clock_boundary_requests_tools_disabled_final_report(self, agent):
+        resp = _mock_response(content="Verified result; one follow-up remains.")
+        agent.client.chat.completions.create.return_value = resp
+        agent._cached_system_prompt = "You are helpful."
+        messages = [
+            {"role": "user", "content": "do stuff"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "function": {"name": "execute_code", "arguments": "{}"},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": "tool result",
+            },
+        ]
+
+        result = agent._handle_max_iterations(
+            messages,
+            18,
+            reason="wall_clock",
+        )
+
+        assert result == "Verified result; one follow-up remains."
+        assert "wall-clock safety limit" in messages[-2]["content"]
+        assert messages[-1] == {"role": "assistant", "content": result}
+        kwargs = agent.client.chat.completions.create.call_args.kwargs
+        assert "tools" not in kwargs
+
     def test_api_failure_returns_error(self, agent):
         agent.client.chat.completions.create.side_effect = Exception("API down")
         agent._cached_system_prompt = "You are helpful."
