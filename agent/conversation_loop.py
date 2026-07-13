@@ -623,6 +623,16 @@ def run_conversation(
         _turn_max_seconds = 1200.0
     _turn_deadline = (time.monotonic() + _turn_max_seconds) if _turn_max_seconds > 0 else None
 
+    # Session input-token ceiling: cap cumulative prompt tokens for this agent
+    # instance so a failing-tool loop re-sending a large pinned context cannot
+    # burn unbounded tokens (2026-07-13: session api_1783962481 burned 833k
+    # input tokens -- ~31 calls x ~26k pinned context against a dead CDP
+    # browser tool). Env HERMES_MAX_SESSION_INPUT_TOKENS overrides; 0 disables.
+    try:
+        _session_input_token_ceiling = int(float(os.getenv("HERMES_MAX_SESSION_INPUT_TOKENS", "500000")))
+    except (TypeError, ValueError):
+        _session_input_token_ceiling = 500_000
+
     # Per-turn tally of consecutive successful credential-pool token refreshes,
     # keyed by (provider, pool-entry-id). A persistent upstream 401 lets
     # ``try_refresh_current()`` "succeed" forever on a single-entry OAuth pool,
@@ -665,6 +675,18 @@ def run_conversation(
                     f"\n⏱️  Turn exceeded {int(_turn_max_seconds)}s wall-clock budget — "
                     "aborting to prevent a runaway."
                 )
+            break
+
+        # Session input-token ceiling (see _session_input_token_ceiling above):
+        # refuse further model calls once cumulative input tokens cross the cap.
+        _session_in_tokens = int(getattr(agent, "session_prompt_tokens", 0) or 0)
+        if _session_input_token_ceiling > 0 and _session_in_tokens >= _session_input_token_ceiling:
+            _turn_exit_reason = f"session_input_token_ceiling({_session_input_token_ceiling})"
+            agent._safe_print(
+                f"\n\U0001F6D1 Session consumed {_session_in_tokens:,} input tokens "
+                f"(ceiling {_session_input_token_ceiling:,}). Refusing further model calls -- "
+                "start a new session (/new) or raise HERMES_MAX_SESSION_INPUT_TOKENS."
+            )
             break
         
         api_call_count += 1
