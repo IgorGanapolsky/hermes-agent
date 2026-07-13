@@ -1922,6 +1922,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
+                "toolsets_write": True,
                 "audio_api": False,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -1941,6 +1942,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
+                "toolset_toggle": {"method": "PUT", "path": "/v1/toolsets/{name}"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
                 "session_create": {"method": "POST", "path": "/api/sessions"},
                 "session": {"method": "GET", "path": "/api/sessions/{session_id}"},
@@ -2012,6 +2014,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "api_server",
                 include_default_mcp_servers=False,
             )
+            agent_cfg = config.get("agent") if isinstance(config.get("agent"), dict) else {}
+            disabled_policy = {
+                str(ts) for ts in (agent_cfg.get("disabled_toolsets") or [])
+            }
             data: List[Dict[str, Any]] = []
             for name, label, desc in _get_effective_configurable_toolsets():
                 try:
@@ -2019,14 +2025,26 @@ class APIServerAdapter(BasePlatformAdapter):
                 except Exception:
                     tools = []
                 is_enabled = name in enabled_toolsets
-                data.append({
+                row: Dict[str, Any] = {
                     "name": name,
                     "label": label,
                     "description": desc,
                     "enabled": is_enabled,
                     "configured": _toolset_has_keys(name, config),
                     "tools": tools,
-                })
+                }
+                if name in disabled_policy:
+                    row["disabled_by_policy"] = True
+                    if name == "browser":
+                        row["disabled_reason"] = (
+                            "Browser is off on this computer until Chrome CDP "
+                            "at localhost:9222 is healthy."
+                        )
+                    else:
+                        row["disabled_reason"] = (
+                            "Disabled on this computer for safety."
+                        )
+                data.append(row)
         except Exception:
             logger.exception("GET /v1/toolsets failed")
             return web.json_response(
@@ -2039,6 +2057,84 @@ class APIServerAdapter(BasePlatformAdapter):
             "platform": "api_server",
             "data": data,
         })
+
+    async def _handle_toolset_toggle(self, request: "web.Request") -> "web.Response":
+        """PUT /v1/toolsets/{name} — enable/disable for the api_server platform.
+
+        Mobile Tools toggles write ``platform_toolsets.api_server`` (not cli).
+        Uses the same ``_save_platform_tools`` helper as the desktop dashboard
+        so enabling a toolset also clears it from ``agent.disabled_toolsets``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        name = request.match_info.get("name", "").strip()
+        if not name:
+            return web.json_response(
+                _openai_error("Missing toolset name", code="invalid_request"),
+                status=400,
+            )
+
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response(
+                _openai_error("Invalid JSON body", code="invalid_request"),
+                status=400,
+            )
+        if not isinstance(body, dict) or "enabled" not in body:
+            return web.json_response(
+                _openai_error("Body must include boolean enabled", code="invalid_request"),
+                status=400,
+            )
+        enabled = bool(body.get("enabled"))
+
+        try:
+            from hermes_cli.config import load_config
+            from hermes_cli.tools_config import (
+                CONFIGURABLE_TOOLSETS,
+                _get_effective_configurable_toolsets,
+                _get_platform_tools,
+                _get_plugin_toolset_keys,
+                _save_platform_tools,
+            )
+
+            valid = {ts_key for ts_key, _, _ in _get_effective_configurable_toolsets()}
+            if name not in valid:
+                return web.json_response(
+                    _openai_error(f"Unknown toolset: {name}", code="invalid_request"),
+                    status=400,
+                )
+
+            config = load_config()
+            current = set(
+                _get_platform_tools(
+                    config,
+                    "api_server",
+                    include_default_mcp_servers=False,
+                )
+            )
+            platform_toolsets = config.get("platform_toolsets") or {}
+            saved = platform_toolsets.get("api_server")
+            if isinstance(saved, list):
+                configurable = {ts_key for ts_key, _, _ in CONFIGURABLE_TOOLSETS}
+                configurable |= _get_plugin_toolset_keys()
+                current |= {str(ts) for ts in saved if str(ts) in configurable}
+
+            if enabled:
+                current.add(name)
+            else:
+                current.discard(name)
+            _save_platform_tools(config, "api_server", current)
+        except Exception:
+            logger.exception("PUT /v1/toolsets/%s failed", name)
+            return web.json_response(
+                _openai_error("Failed to update toolset", err_type="server_error"),
+                status=500,
+            )
+
+        return web.json_response({"ok": True, "name": name, "enabled": enabled})
 
     # ------------------------------------------------------------------
     # /api/sessions — thin client/session resource API
@@ -5206,6 +5302,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            self._app.router.add_put("/v1/toolsets/{name}", self._handle_toolset_toggle)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/projects", self._handle_projects)
             self._app.router.add_get("/v1/obsidian/projects", self._handle_obsidian_projects)
