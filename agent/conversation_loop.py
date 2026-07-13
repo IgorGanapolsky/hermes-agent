@@ -626,6 +626,16 @@ def run_conversation(
     # over instead of spinning. Reset here so each turn starts fresh. See #26080.
     agent._auth_pool_refresh_counts = {}
 
+    # Session input-token ceiling: cap cumulative prompt tokens for this agent
+    # instance so a failing-tool loop re-sending a large pinned context cannot
+    # burn unbounded tokens (2026-07-13: session api_1783962481 burned 833k
+    # input tokens -- ~31 calls x ~26k pinned context against a dead CDP
+    # browser tool). Env HERMES_MAX_SESSION_INPUT_TOKENS overrides; 0 disables.
+    try:
+        _session_input_token_ceiling = int(float(os.getenv("HERMES_MAX_SESSION_INPUT_TOKENS", "500000")))
+    except (TypeError, ValueError):
+        _session_input_token_ceiling = 500_000
+
     # Optional opt-in runtime: if api_mode == codex_app_server, hand the
     # turn to the codex app-server subprocess (terminal/file ops/patching
     # all run inside Codex). Default Hermes path is bypassed entirely.
@@ -650,6 +660,18 @@ def run_conversation(
             _turn_exit_reason = "interrupted_by_user"
             if not agent.quiet_mode:
                 agent._safe_print("\n⚡ Breaking out of tool loop due to interrupt...")
+            break
+
+        # Session input-token ceiling (see _session_input_token_ceiling above):
+        # refuse further model calls once cumulative input tokens cross the cap.
+        _session_in_tokens = int(getattr(agent, "session_prompt_tokens", 0) or 0)
+        if _session_input_token_ceiling > 0 and _session_in_tokens >= _session_input_token_ceiling:
+            _turn_exit_reason = f"session_input_token_ceiling({_session_input_token_ceiling})"
+            agent._safe_print(
+                f"\n\U0001F6D1 Session consumed {_session_in_tokens:,} input tokens "
+                f"(ceiling {_session_input_token_ceiling:,}). Refusing further model calls -- "
+                "start a new session (/new) or raise HERMES_MAX_SESSION_INPUT_TOKENS."
+            )
             break
         
         api_call_count += 1
