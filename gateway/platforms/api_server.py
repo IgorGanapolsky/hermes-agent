@@ -61,6 +61,7 @@ from gateway.platforms.base import (
     validate_media_delivery_path,
 )
 from agent.redact import redact_sensitive_text
+import inspect
 
 logger = logging.getLogger(__name__)
 
@@ -2214,7 +2215,20 @@ class APIServerAdapter(BasePlatformAdapter):
         if db is None:
             return []
         try:
-            return db.get_messages_as_conversation(session_id)
+            # Match GET /messages: follow compression tip so mobile does not chat
+            # against a parent id while turns live on the child (context drop).
+            tip = db.resolve_resume_session_id(session_id)
+            # SessionDB 0.18.2 (Mini) has no repair_alternation=; newer Pro does.
+            # Passing the kwarg on Mini TypeErrors → empty history (mobile context drop).
+            kwargs: Dict[str, Any] = {}
+            try:
+                if "repair_alternation" in inspect.signature(
+                    db.get_messages_as_conversation
+                ).parameters:
+                    kwargs["repair_alternation"] = True
+            except (TypeError, ValueError):
+                pass
+            return db.get_messages_as_conversation(tip, **kwargs)
         except Exception as exc:
             logger.warning("Failed to load session history for %s: %s", session_id, exc)
             return []
