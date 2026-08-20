@@ -1531,6 +1531,27 @@ class APIServerAdapter(BasePlatformAdapter):
             pass
         return resolve_effective_model(explicit, profile_name, "hermes-agent")
 
+
+    @staticmethod
+    def _is_virtual_api_model(model: Optional[str], virtual_model: Optional[str] = None) -> bool:
+        """True when ``model`` is the OpenAI-compat platform label, not an LLM id.
+
+        ``/v1/models`` advertises ``hermes-agent`` (or API_SERVER_MODEL_NAME) as a
+        stable virtual id. Clients and ``POST /api/sessions`` often persist that
+        label on the session row; treating it as a real model pin sends
+        ``hermes-agent`` to the upstream provider (LiteLLM/OpenRouter) and 400s
+        with "hermes-agent is not a valid model ID".
+        """
+        name = _clean_request_string(model)
+        if not name:
+            return False
+        lowered = name.lower()
+        if lowered in {"hermes-agent", "hermes", "gateway"}:
+            return True
+        virt = _clean_request_string(virtual_model)
+        return bool(virt) and lowered == virt.lower()
+
+
     def _cors_headers_for_origin(self, origin: str) -> Optional[Dict[str, str]]:
         """Return CORS headers for an allowed browser origin."""
         if not origin or not self._cors_origins:
@@ -2593,9 +2614,40 @@ class APIServerAdapter(BasePlatformAdapter):
         # its provider cannot be resolved.
         session_key = gateway_session_key or session_id
         session_row_model = _clean_request_string(session_model)
+        # Platform label persisted on session create must not pin upstream model.
+        # Also ignore a session row that merely echoes model.default: applying it
+        # re-resolves provider="custom" and can swap litellm-gateway ( :4010 ) for
+        # another custom_* OpenRouter base_url, then 400 on the model id.
+        gateway_default = None
+        try:
+            from gateway.run import _resolve_gateway_model
+            gateway_default = _clean_request_string(_resolve_gateway_model())
+        except Exception:
+            gateway_default = None
+        if self._is_virtual_api_model(session_row_model, self._model_name) or (
+            gateway_default
+            and session_row_model
+            and session_row_model.lower() == gateway_default.lower()
+        ):
+            logger.debug(
+                "api_server ignoring non-pin session model %r; using gateway default %r",
+                session_row_model,
+                gateway_default,
+            )
+            session_row_model = None
         session_override = None
         if not confirmed_runtime_lock:
             session_override = self._session_model_override_for(session_key)
+            if isinstance(session_override, dict):
+                ov_model = _clean_request_string(session_override.get("model"))
+                if self._is_virtual_api_model(ov_model, self._model_name):
+                    logger.debug(
+                        "api_server ignoring virtual /model override %r",
+                        ov_model,
+                    )
+                    session_override = {
+                        k: v for k, v in session_override.items() if k != "model"
+                    } or None
         # Model-string precedence delegates to the shared owner
         # hermes_cli.model_switch.resolve_effective_model (session /model
         # override > session-persisted model > global) — the rule 7dd00bb47d
@@ -3237,7 +3289,17 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(session_id) > self._MAX_SESSION_HEADER_LEN:
             return web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
 
-        model = body.get("model") or self._model_name
+        # Prefer an explicit client model; otherwise persist the real gateway
+        # default (config model.default), never the virtual /v1/models label.
+        raw_model = body.get("model")
+        if self._is_virtual_api_model(raw_model, self._model_name) or not _clean_request_string(raw_model):
+            try:
+                from gateway.run import _resolve_gateway_model
+                model = _resolve_gateway_model() or self._model_name
+            except Exception:
+                model = self._model_name
+        else:
+            model = raw_model
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
@@ -3246,7 +3308,12 @@ class APIServerAdapter(BasePlatformAdapter):
         lock_error = self._runtime_lock_error(runtime_request)
         if lock_error is not None:
             return lock_error
-        requested = runtime_request.get("requested") or {}
+        requested = dict(runtime_request.get("requested") or {})
+        # requested.model from body must not re-introduce the virtual API label
+        # after we already resolved model.default above.
+        if self._is_virtual_api_model(requested.get("model"), self._model_name):
+            requested.pop("model", None)
+            runtime_request["requested"] = requested
         model_name = self._clean_runtime_id(requested.get("model")) or (str(model) if model else None)
         model_config = None
         if requested.get("model") or requested.get("provider"):
@@ -3493,6 +3560,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
             stored_model = session.get("model") if isinstance(session, dict) else None
+            if self._is_virtual_api_model(stored_model, self._model_name):
+                stored_model = None
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
@@ -3603,6 +3672,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
             stored_model = session.get("model") if isinstance(session, dict) else None
+            if self._is_virtual_api_model(stored_model, self._model_name):
+                stored_model = None
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
