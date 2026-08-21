@@ -895,6 +895,7 @@ class TestProfilesEndpoint:
 
         assert body["object"] == "hermes.profile.list"
         assert body["canonical_chat_title"] == "Bot Chat"
+        assert body["bot_mode_protocol"] is False
         assert body["data"] == [
             {
                 "id": "default",
@@ -2924,4 +2925,3 @@ class TestCreateAgentModelRecovery:
         )
         adapter._create_agent(session_id="another-session", gateway_session_key="stable-chan-1")
         assert captured[1]["model"] == "minimax/minimax-m3"
-
