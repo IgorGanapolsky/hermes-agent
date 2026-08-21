@@ -298,8 +298,11 @@ def _contains_unsafe_gateway_action(
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
-        except OSError:
-            resolved = script_path
+        except (OSError, ValueError):
+            # ValueError: embedded null byte — a malformed extracted path is
+            # not evidence of a lifecycle action; skip it instead of crashing
+            # the entire command through the terminal tool.
+            continue
         if resolved in visited:
             continue
         visited.add(resolved)
